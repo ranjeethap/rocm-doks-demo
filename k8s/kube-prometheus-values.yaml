@@ -1,0 +1,6 @@
+grafana:
+  defaultDashboardsEnabled: true
+  adminPassword: "admin"
+prometheus:
+  prometheusSpec:
+    retention: 12h

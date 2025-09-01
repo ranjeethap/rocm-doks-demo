@@ -1,0 +1,12 @@
+rules:
+  default: false
+  custom:
+    - seriesQuery: '{__name__="container_cpu_usage_seconds_total"}'
+      resources:
+        overrides:
+          namespace: { resource: "namespace" }
+          pod: { resource: "pod" }
+      name:
+        matches: "^(.*)_total"
+        as: "${1}_per_second"
+      metricsQuery: 'sum(rate(container_cpu_usage_seconds_total{container!="",pod!=""}[2m])) by (namespace,pod)'

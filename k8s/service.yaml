@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: matmul-api
+  namespace: dev
+spec:
+  type: LoadBalancer
+  selector:
+    app: matmul-api
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP

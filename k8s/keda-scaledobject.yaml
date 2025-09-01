@@ -1,0 +1,20 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: matmul-keda
+  namespace: dev
+spec:
+  scaleTargetRef:
+    kind: Deployment
+    name: matmul-api
+  cooldownPeriod: 60
+  pollingInterval: 15
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        metricName: http_requests_per_second
+        threshold: "50"
+        query: sum(rate(nginx_ingress_controller_requests{ingress="matmul-api"}[1m]))

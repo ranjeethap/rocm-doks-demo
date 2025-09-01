@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: matmul-api
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: matmul-api
+  namespaceSelector:
+    matchNames: ["dev"]
+  endpoints:
+    - port: http
+      targetPort: 8080
+      path: /metrics

@@ -1,0 +1,2 @@
+kubecostProductConfigs:
+  clusterName: rocm-gpu-demo
