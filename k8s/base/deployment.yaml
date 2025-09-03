@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: matmul-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: matmul-api }
+  template:
+    metadata: { labels: { app: matmul-api } }
+    spec:
+      imagePullSecrets: [ { name: docr-secret } ]
+      containers:
+        - name: api
+          image: app         # <-- replaced by overlays
+          imagePullPolicy: IfNotPresent
+          ports: [ { containerPort: 8080 } ]
+          env:
+            - { name: ROCM_VISIBLE_DEVICES, value: "0" }
+            - name: ENABLE_GPU
+              valueFrom: { configMapKeyRef: { name: matmul-config, key: enable_gpu } }
+          resources:
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits:   { cpu: "1000m", memory: "1024Mi" }
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, initialDelaySeconds: 5, periodSeconds: 5 }
+          livenessProbe:  { httpGet: { path: /healthz, port: 8080 }, initialDelaySeconds: 10, periodSeconds: 10 }
+      nodeSelector: { role: "cpu" }
+      tolerations: []
+

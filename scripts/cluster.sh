@@ -2,111 +2,129 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "${ROOT}/scripts/lib.sh"
+TF_DIR="${ROOT}/terraform"
 
-# --- auto-install helpers ---
-add_or_update_repo() {
-  local name="$1" url="$2"
-  if helm repo list | awk 'NR>1{print $1}' | grep -qx "$name"; then
-    helm repo add "$name" "$url" --force-update >/dev/null 2>&1 || true
-  else
-    retry 5 helm repo add "$name" "$url"
-  fi
+# load .env
+if [[ -f "${ROOT}/.env" ]]; then set -a; . "${ROOT}/.env"; set +a; fi
+
+DO_REGION="${DO_REGION:-nyc1}"
+DO_PROJECT_NAME="${DO_PROJECT_NAME:-rocm-doks-demo}"
+K8S_VERSION="${K8S_VERSION:-1.31.9-do.3}"
+
+INSTALL_ARGOCD="${INSTALL_ARGOCD:-true}"
+INSTALL_SEALED="${INSTALL_SEALED:-true}"
+INSTALL_METRICS="${INSTALL_METRICS:-true}"
+
+req() { for c in "$@"; do command -v "$c" >/dev/null || { echo "Missing: $c"; exit 1; }; done; }
+req doctl kubectl terraform helm
+
+[[ -n "${DO_TOKEN:-}" ]] || { echo "Missing DO_TOKEN in env/.env"; exit 1; }
+export DIGITALOCEAN_TOKEN="$DO_TOKEN"
+
+retry() { local n="$1"; shift; local i=1; until "$@"; do ((i>=n))&&return 1; echo "Retry $i/$n failed: $*"; sleep $((2*i)); ((i++)); done; }
+
+wait_for_argocd_crds() {
+  kubectl wait --for=condition=Established crd/applications.argoproj.io --timeout=180s
+  kubectl wait --for=condition=Established crd/appprojects.argoproj.io --timeout=180s
+}
+
+apply_argocd_apps() {
+  # ensure kube creds are fresh before touching CRDs
+  ensure_kube
+  wait_for_argocd_crds
+  # apply your GitOps apps idempotently
+  kubectl apply -f k8s/argocd/app-dev.yaml
+  kubectl apply -f k8s/argocd/app-prod.yaml
+  # ask Argo to reconcile immediately
+  kubectl -n argocd annotate app rocm-matmul-dev  argocd.argoproj.io/refresh=hard --overwrite || true
+  kubectl -n argocd annotate app rocm-matmul-prod argocd.argoproj.io/refresh=hard --overwrite || true
+}
+
+ensure_kube() {
+  retry 5 doctl kubernetes cluster kubeconfig save "${DO_PROJECT_NAME}" \
+    --access-token "$DIGITALOCEAN_TOKEN" --alias "${DO_PROJECT_NAME}" --set-current-context
+  kubectl version --short >/dev/null
+  kubectl get nodes >/dev/null
+}
+
+add_repo() { local n="$1" u="$2"; if helm repo list | awk 'NR>1{print $1}' | grep -qx "$n"; then helm repo add "$n" "$u" --force-update >/dev/null 2>&1 || true; else retry 5 helm repo add "$n" "$u"; fi; }
+helm_install_wait() { # rel chart ns [args...]
+  local rel="$1" chart="$2" ns="$3"; shift 3
+  kubectl create ns "$ns" --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+  retry 3 helm upgrade --install "$rel" "$chart" -n "$ns" --timeout 10m --wait --atomic "$@"
 }
 
 install_argocd() {
-  add_or_update_repo argo https://argoproj.github.io/argo-helm
-  helm repo update
-  retry 3 helm upgrade --install argocd argo/argo-cd \
-    --namespace argocd --create-namespace --wait
+  add_repo argo https://argoproj.github.io/argo-helm; helm repo update
+  ensure_kube
+  helm_install_wait argocd argo/argo-cd argocd
+  echo "ArgoCD admin password:"; kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d || true; echo
+}
 
-  # Optionally expose via LoadBalancer (set ARGOCD_EXPOSE_LB=true in .env)
-  if [[ "${ARGOCD_EXPOSE_LB:-false}" == "true" ]]; then
-    kubectl -n argocd patch svc argocd-server -p '{"spec":{"type":"LoadBalancer"}}' || true
+install_sealed() {
+  add_repo sealed-secrets https://bitnami-labs.github.io/sealed-secrets; helm repo update
+  ensure_kube
+  helm_install_wait sealed-secrets sealed-secrets/sealed-secrets kube-system
+}
+
+install_metrics() {
+  add_repo ingress-nginx https://kubernetes.github.io/ingress-nginx
+  add_repo prometheus-community https://prometheus-community.github.io/helm-charts
+  add_repo kedacore https://kedacore.github.io/charts
+  add_repo metrics-server https://kubernetes-sigs.github.io/metrics-server/
+  helm repo update
+
+  # ingress controller (LB + metrics)
+  helm_install_wait ingress-nginx ingress-nginx/ingress-nginx ingress-nginx \
+    --set controller.metrics.enabled=true --set controller.service.type=LoadBalancer
+
+  # kube-prometheus-stack (Grafana/Prom/Alertmanager); expose via LB if requested
+  if [[ "${EXPOSE_MONITORING_LB:-false}" == "true" ]]; then
+    helm_install_wait kube-prometheus-stack prometheus-community/kube-prometheus-stack monitoring \
+      --set grafana.service.type=LoadBalancer \
+      --set prometheus.service.type=LoadBalancer \
+      --set alertmanager.service.type=LoadBalancer
+  else
+    helm_install_wait kube-prometheus-stack prometheus-community/kube-prometheus-stack monitoring
   fi
 
-  echo "🎯 ArgoCD installed."
-  echo "Admin password:"
-  kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; echo
+  # metrics-server (proper args array)
+  helm_install_wait metrics-server metrics-server/metrics-server kube-system \
+    --set-string args[0]=--kubelet-insecure-tls \
+    --set-string args[1]=--kubelet-preferred-address-types=InternalIP
+
+  # KEDA
+  helm_install_wait keda kedacore/keda keda
 }
 
-install_sealed_secrets() {
-  add_or_update_repo sealed-secrets https://bitnami-labs.github.io/sealed-secrets
-  helm repo update
-  retry 3 helm upgrade --install sealed-secrets sealed-secrets/sealed-secrets \
-    --namespace kube-system --wait
-  echo "🔐 Sealed Secrets installed."
+tf_apply() {
+  export TF_VAR_do_token="$DO_TOKEN"
+  terraform -chdir="$TF_DIR" init -upgrade
+  terraform -chdir="$TF_DIR" apply -auto-approve \
+    -var="do_token=$DO_TOKEN" -var="region=$DO_REGION" -var="cluster_name=$DO_PROJECT_NAME" -var="k8s_version=$K8S_VERSION"
+}
+tf_destroy() {
+  export TF_VAR_do_token="$DO_TOKEN"
+  terraform -chdir="$TF_DIR" init -upgrade
+  terraform -chdir="$TF_DIR" destroy -auto-approve \
+    -var="do_token=$DO_TOKEN" -var="region=$DO_REGION" -var="cluster_name=$DO_PROJECT_NAME" -var="k8s_version=$K8S_VERSION"
 }
 
-# Auto-load and export variables from .env if present
-ENV_FILE="${ROOT}/.env"
-if [[ -f "$ENV_FILE" ]]; then
-  set -a              # auto-export all variables loaded below
-  . "$ENV_FILE"       # source .env
-  set +a
-fi
-
-
-CMD="${1:-}"
-case "${CMD}" in
+case "${1:-}" in
   create)
-    require_env DO_TOKEN "Set DO_TOKEN in .env and 'source .env'"
-    export TF_VAR_do_token="${DO_TOKEN}"
-    export TF_VAR_region="${DO_REGION:-nyc1}"
-    export TF_VAR_cluster_name="${DO_PROJECT_NAME:-rocm-gpu-demo}"
-    export TF_VAR_enable_gpu="${ENABLE_GPU:-false}"
-    export TF_VAR_gpu_node_size="${GPU_NODE_SIZE:-gpu-mi300x1-192gb}"
-
-    pushd "${ROOT}/terraform" >/dev/null
-    terraform init -upgrade
-    terraform apply -auto-approve
-    popd >/dev/null
-
-    # Save kubeconfig
-    doctl kubernetes cluster kubeconfig save "${DO_PROJECT_NAME:-rocm-gpu-demo}" \
-      --access-token "${DO_TOKEN}" \
-      --alias "${DO_PROJECT_NAME:-rocm-gpu-demo}" \
-      --set-current-context
+    echo "==> Creating DOKS cluster ${DO_PROJECT_NAME}…"; tf_apply
+    echo "==> Kubeconfig…"; ensure_kube
+    echo "==> Wiring Argo Applications (dev & prod)…"
+    apply_argocd_apps
+    [[ "$INSTALL_SEALED" == "true" ]]   && { echo "==> Sealed Secrets…"; install_sealed; }
+    [[ "$INSTALL_ARGOCD" == "true" ]]   && { echo "==> ArgoCD…"; install_argocd; }
+    [[ "$INSTALL_METRICS" == "true" ]]  && { echo "==> Addons…"; install_metrics; }
+    echo "✅ Cluster ready."
     ;;
-
-    # Install GitOps & secrets controllers automatically
-    install_argocd
-    install_sealed_secrets
-
-    # Apply your ArgoCD Application if present
-    if [[ -f "${ROOT}/argocd-app.yaml" ]]; then
-      kubectl apply -f "${ROOT}/argocd-app.yaml"
-      echo "✅ Applied ArgoCD Application (argocd-app.yaml)."
-    fi
-
-
-  nodeup)
-    require_env DO_TOKEN
-    CLUSTER_ID="$(doctl kubernetes cluster list --access-token "${DO_TOKEN}" --format ID,Name | awk -v n="${DO_PROJECT_NAME:-rocm-gpu-demo}" '$2==n{print $1}')"
-    NP_NAME="${2:-cpu-pool}"
-    COUNT="${3:-1}"
-    NP_ID="$(doctl kubernetes cluster node-pool list "$CLUSTER_ID" --access-token "${DO_TOKEN}" --format ID,Name | awk -v n="$NP_NAME" '$2==n{print $1}')"
-    doctl kubernetes cluster node-pool update "$CLUSTER_ID" "$NP_ID" --count "$COUNT" --access-token "${DO_TOKEN}"
-    ;;
-
-  nodedown)
-    require_env DO_TOKEN
-    CLUSTER_ID="$(doctl kubernetes cluster list --access-token "${DO_TOKEN}" --format ID,Name | awk -v n="${DO_PROJECT_NAME:-rocm-gpu-demo}" '$2==n{print $1}')"
-    NP_NAME="${2:-cpu-pool}"
-    NP_ID="$(doctl kubernetes cluster node-pool list "$CLUSTER_ID" --access-token "${DO_TOKEN}" --format ID,Name | awk -v n="$NP_NAME" '$2==n{print $1}')"
-    doctl kubernetes cluster node-pool update "$CLUSTER_ID" "$NP_ID" --count 0 --access-token "${DO_TOKEN}"
-    ;;
-
   delete)
-    require_env DO_TOKEN
-    pushd "${ROOT}/terraform" >/dev/null
-    TF_VAR_do_token="${DO_TOKEN}" terraform destroy -auto-approve || true
-    popd >/dev/null
+    echo "==> Destroying DOKS cluster ${DO_PROJECT_NAME}…"; tf_destroy; echo "✅ Done."
     ;;
-
   *)
-    cat <<EOF
-Usage: $0 {create|nodeup [pool count]|nodedown [pool]|delete}
-EOF
-    ;;
+    echo "Usage: $(basename "$0") <create|delete>"; exit 1;;
 esac
+

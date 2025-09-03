@@ -1,10 +1,11 @@
-# ROCm base with build toolchain and hipBLAS
-FROM rocm/dev-ubuntu-22.04:7.0-complete
+# ROCm base with HIP/hipBLAS toolchain
+FROM rocm/dev-ubuntu-22.04:latest
 
 # System deps
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    python3 python3-pip build-essential cmake git curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    build-essential cmake git wget curl ca-certificates python3 python3-pip \
+    hip-runtime-amd hipblas-dev rocblas-dev \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: matmul-config
+data:
+  enable_gpu: "false"
+

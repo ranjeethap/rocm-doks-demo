@@ -1,28 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
+req(){ for c in "$@"; do command -v "$c" >/dev/null || { echo "Missing: $c"; exit 1; }; done; }
+req doctl docker trivy kubectl
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "${ROOT}/scripts/lib.sh"
+set -a; [[ -f "$ROOT/.env" ]] && . "$ROOT/.env"; set +a
 
-require_cmd docker trivy kubectl helm
-ns_exists dev || kubectl create ns dev
+REG="${REGISTRY_HOST:-registry.digitalocean.com/dokr-saas}"
+TAG="${1:-dev}"
+IMAGE="${REG}/matmul:${TAG}"
 
-IMAGE="${DOCR_REPO:-registry.digitalocean.com/rocm-gpu-demo/matmul}:${TAG:-v0.1.$(date +%s)}"
+echo "==> DOCR login"
+doctl registry login
 
-echo "Building multi-arch image with buildx (CPU-only fallback works everywhere; ROCm libs present for GPU nodes)..."
-docker buildx create --use >/dev/null 2>&1 || true
-docker buildx build --platform linux/amd64 -t "$IMAGE" -f "${ROOT}/app/Dockerfile" "${ROOT}/app" --push
+echo "==> Build & push $IMAGE"
+docker buildx build -t "$IMAGE" --platform linux/amd64 -f app/Dockerfile app --push
 
-echo "Scanning image with Trivy (fail on HIGH/CRITICAL)..."
-trivy image --exit-code 1 --severity HIGH,CRITICAL "$IMAGE" || { echo "Trivy found HIGH/CRITICAL issues"; exit 1; }
+echo "==> Trivy scan (fail on HIGH/CRITICAL)"
+trivy image --exit-code 1 --severity HIGH,CRITICAL "$IMAGE"
 
-echo "Templating manifests with image tag..."
-yq e ".spec.template.spec.containers[0].image = \"$IMAGE\"" "${ROOT}/k8s/deployment.yaml" | kubectl apply -f -
+if [[ "$TAG" == "dev" ]]; then
+  echo "==> Argo refresh (dev)"
+  kubectl -n argocd annotate app rocm-matmul-dev argocd.argoproj.io/refresh=hard --overwrite || true
+fi
+echo "✅ $IMAGE"
 
-kubectl apply -f "${ROOT}/k8s/service.yaml"
-kubectl apply -f "${ROOT}/k8s/ingress.yaml" || true
-kubectl apply -f "${ROOT}/k8s/hpa.yaml"
-
-echo "If you need DOCR pull secret in cluster:"
-echo "  kubectl -n dev create secret docker-registry docr --docker-server=$(echo $IMAGE | cut -d/ -f1,2) --docker-username=$(doctl registry docker-config-json --expiry-seconds 3600 | jq -r '.auths | to_entries[0].value.username') --docker-password=$(doctl registry docker-config-json --expiry-seconds 3600 | jq -r '.auths | to_entries[0].value.password')"
-echo "Then seal it with kubeseal and apply to dev namespace."
