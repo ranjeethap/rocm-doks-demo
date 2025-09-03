@@ -3,6 +3,7 @@ kind: Kustomization
 namespace: dev
 resources:
   - ../../base
+  - docr-sealedsecret.yaml
 images:
   - name: app
     newName: registry.digitalocean.com/dokr-saas/matmul
