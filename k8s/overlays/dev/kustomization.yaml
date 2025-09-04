@@ -3,6 +3,8 @@ kind: Kustomization
 namespace: dev
 resources:
   - ../../base
+  - hpa.yaml
+  - ingress.yaml
   - docr-sealedsecret.yaml
 images:
   - name: app
